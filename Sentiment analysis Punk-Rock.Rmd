@@ -1,0 +1,1164 @@
+---
+title: "Sentiment Analysis"
+author: "Simon"
+date: "30/11/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(magrittr)
+library(FactoMineR)
+library(factoextra)
+library(uwot)
+library(GGally)
+library(rsample)
+library(ggridges)
+library(xgboost)
+library(recipes)
+library(parsnip)
+library(glmnet)
+library(tidymodels)
+library(skimr)
+library(VIM)
+library(visdat)
+library(ggmap)
+library(ranger)
+library(vip)
+library(SnowballC)
+library(tokenizers)
+library(formatR)
+
+```
+
+
+# Data
+
+Link to [dataset](https://www.kaggle.com/neisse/scrapped-lyrics-from-6-genres) 
+
+```{r}
+library(readr)
+
+data_start <- read_csv("C:/Users/Simon ik mig/Downloads/lyrics-data.csv.zip")
+artists_data <- read_csv("C:/Users/Simon ik mig/Downloads/artists-data (1).csv")
+```
+
+**Artist data**
+```{r}
+artists = artists_data %>% 
+  group_by(Artist) %>% 
+  count(Genre) %>% 
+  pivot_wider(names_from = Genre, values_from = n) %>% 
+  replace_na(list(Pop = 0, "Hip Hop" = 0, Rock = 0, "Funk Carioca" = 0,
+                  "Sertanejo" = 0, Samba = 0 )) %>% 
+  ungroup() %>% 
+  left_join(artists_data, by = c("Artist")) %>% 
+  select(-c(Genre, Genres, Popularity, Songs)) %>% 
+  distinct()
+```
+
+**Data Rock or Pop**
+```{r}
+data_genre = data_start %>% 
+  filter(Idiom == "ENGLISH") %>% 
+  rename("Link" = "ALink") %>% 
+  inner_join(artists, by = c("Link")) %>% 
+  distinct() %>%
+  mutate(name = paste(Artist, SName))%>%
+  rename(text=Lyric) %>%
+  filter(Pop==1 | Rock==1) %>%
+  select(name, text, Pop, Rock) %>%
+  distinct(name, .keep_all = T)
+
+
+
+data_pop_rock=data_genre %>%
+  mutate(genre = ifelse(Pop==1 & Rock == 1, "pop/rock",
+                        ifelse(Rock==1 & Pop==0, "Rock", 
+                               ifelse(Rock == 0 & Pop == 1, "Pop", 0)))) %>%
+  select(-c(Pop, Rock))
+
+data_pop_rock_labels= data_pop_rock %>%
+  select(name, genre)
+```
+
+
+
+
+**Data Rock and Pop**
+
+```{r}
+data = data_start %>% 
+  filter(Idiom == "ENGLISH") %>% 
+  rename("Link" = "ALink") %>% 
+  inner_join(artists, by = c("Link")) %>% 
+  distinct() %>%
+  mutate(name = paste(Artist, SName))%>%
+  rename(text=Lyric) %>%
+  filter(Rock==1 & Pop==1) %>%
+  select(name, text)%>%
+  distinct(name, .keep_all = T)
+```
+
+
+
+
+# Preprocessing / EDA
+
+First we tokenize the data. 
+```{r}
+library(tidytext)
+text_genre_tidy = data_pop_rock %>% unnest_tokens(word, text, token = "words")
+
+head(text_genre_tidy)
+```
+
+We remove short words and stopwords.
+```{r}
+text_genre_tidy %<>%
+  filter(str_length(word) > 2 ) %>% 
+  group_by(word) %>%
+  ungroup() %>%
+  anti_join(stop_words, by = 'word') 
+```
+
+We use the hunspell package, which seems to produce the best stemming for our data. Reducing a word to its “root” word. 
+```{r}
+library(hunspell)
+text_genre_tidy %<>% 
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+  select(-word) %>%
+  rename(word = stem)
+
+```
+
+We weight the data using tf-idf (Term-frequency Inverse document frequency). 
+```{r}
+# TFIDF weights
+text_tf_idf= text_genre_tidy %>%
+group_by(name) %>%
+  count(word, sort = TRUE) %>%
+  ungroup() %>% 
+  bind_tf_idf(word, name, n) %>%
+  arrange(desc(tf_idf))
+
+
+text_genre_tf_idf = text_tf_idf %>%
+  left_join(data_pop_rock_labels)
+
+```
+
+We show the 25 most common words within the 3 genres. 
+```{r}
+# TFIDF topwords
+text_genre_tidy_rock= text_genre_tf_idf %>%
+  filter(genre == "Rock")%>%
+count(word, wt = tf_idf, sort = TRUE)%>%
+  filter(!word == "chorus") %>% #remove
+head(25)
+
+text_genre_tidy_rock_pop= text_genre_tf_idf %>%
+  filter(genre == "Pop/Rock")%>%
+count(word, wt = tf_idf, sort = TRUE) %>% #remove
+head(25)
+
+text_genre_tidy_pop= text_genre_tf_idf %>%
+  filter(genre == "Pop")%>%
+count(word, wt = tf_idf, sort = TRUE)%>%
+  filter(!word == "chorus")%>%
+  filter(!word == "ooh")%>% #remove
+head(25)
+
+```
+
+We now plot the 20 most used words within each genre. 
+```{r}
+labels_words <- text_genre_tf_idf %>%
+group_by(genre) %>%
+count(word, wt = tf_idf, sort = TRUE, name = "tf_idf") %>%
+dplyr::slice(1:20)%>%
+  filter(!word == "chorus")%>%
+  filter(!word == "ooh") %>% #slice
+ungroup()
+
+```
+
+```{r}
+labels_words %>%
+mutate(word = reorder_within(word, by = tf_idf, within = genre)) %>% #Pop & Rock
+ggplot(aes(x = word, y = tf_idf, fill = genre)) +
+geom_col(show.legend = FALSE) +
+labs(x = NULL, y = "tf-idf") +
+facet_wrap(~genre, ncol = 2, scales = "free") +
+coord_flip() +
+scale_x_reordered() +
+theme(axis.text.y = element_text(size = 6))
+
+```
+
+## Rock wordcloud
+
+EDA within the Rock genres. 
+```{r}
+text_tidy_rock = text_genre_tidy %>%
+  filter(genre == "Rock")
+```
+
+```{r}
+library(wordcloud)
+```
+
+```{r}
+text_tidy_rock %>%
+count(word) %>%
+with(wordcloud(word, n,
+max.words = 50,
+color = "blue"))
+
+```
+
+## Pop wordcloud
+
+EDA within the Pop genres. 
+```{r}
+text_tidy_Pop = text_genre_tidy %>%
+filter(genre == "Pop")
+
+```
+
+```{r}
+text_tidy_Pop %>%
+count(word) %>%
+with(wordcloud(word, n,
+max.words = 50,
+color = "blue"))
+
+```
+
+## Pop/Rock wordcloud
+
+EDA within the Pop/Rock genres. 
+```{r}
+text_tidy_Pop_Rock = text_genre_tidy %>%
+filter(genre == "pop/rock")
+
+```
+
+```{r}
+text_tidy_Pop_Rock %>%
+count(word) %>%
+with(wordcloud(word, n,
+max.words = 50,
+color = "blue"))
+
+```
+
+
+# Sentiment Analysis
+
+## Rock_Pop
+
+We do a sentiment analysis based on the Pop genre.
+```{r}
+library(textdata)
+
+text_tidy_Pop_Rock_index= text_tidy_Pop_Rock %>%
+mutate(index= 1:n())
+
+```
+
+We use the lexicons “bing” and “afinn” to get a measure for positivity and negativity for each word.
+We use inner_join to only get the words we use from the lexicon.
+```{r}
+#Bing
+sentiment_bing <- text_tidy_Pop_Rock_index %>%
+inner_join(get_sentiments("bing")) %>%
+count(word, index = index %/% 100, sentiment) %>%
+mutate(lexicon = 'Bing')
+
+```
+
+```{r}
+# Afinn
+sentiment_afinn <- text_tidy_Pop_Rock_index %>%
+inner_join(get_sentiments("afinn")) %>%
+group_by(index = index %/% 100) %>%
+summarise(sentiment = sum(value, na.rm = TRUE)) %>%
+mutate(lexicon = 'AFINN')
+
+```
+
+We join the measures from both lexicons. 
+```{r}
+# Lets join them all together for plotting
+sentiment_all <- sentiment_afinn %>%
+bind_rows(sentiment_bing %>%
+pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+mutate(sentiment = positive - negative) %>%
+select(index, sentiment, lexicon))
+
+```
+
+We create a plot for the distribution between negative and positive words within the Pop/Rock genre.
+```{r}
+sentiment_all %>%
+ggplot(aes(x = index, y = sentiment, fill = lexicon)) +
+geom_col(show.legend = FALSE) +
+facet_wrap(~ lexicon) +
+labs(title = "Sentiment Analysis: “Pop/Rock",
+subtitle = 'Using the Bing, AFINN lexicon')
+
+```
+
+### Senteminet wordcloud
+
+We can now create a wordcloud looking at the positive and negative words in the Pop/Rock genre.
+```{r}
+text_tidy_Pop_Rock %>%
+inner_join(get_sentiments("bing")) %>%
+count(word, sentiment, sort = TRUE) %>%
+filter(sentiment %in% c("positive", "negative")) %>%
+pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+as.data.frame() %>%
+remove_rownames() %>%
+column_to_rownames("word") %>%
+comparison.cloud(colors = c("darkgreen", "red"),
+max.words = 100,
+title.size = 1.5)
+
+```
+
+## Pop
+
+We do a sentiment analysis based on the Pop genre.
+```{r}
+library(textdata)
+
+text_tidy_Pop_index= text_tidy_Pop %>%
+mutate(index= 1:n())
+
+```
+
+We use the lexicons “bing” and “afinn” to get a measure for positivity and negativity for each word.
+We use inner_join to only get the words we use from the lexicon.
+```{r}
+#Bing
+sentiment_bing_pop <- text_tidy_Pop_index %>%
+inner_join(get_sentiments("bing")) %>%
+count(word, index = index %/% 100, sentiment) %>%
+mutate(lexicon = 'Bing')
+
+```
+
+```{r}
+# Afinn
+sentiment_afinn_pop <- text_tidy_Pop_index %>%
+inner_join(get_sentiments("afinn")) %>%
+group_by(index = index %/% 100) %>%
+summarise(sentiment = sum(value, na.rm = TRUE)) %>%
+mutate(lexicon = 'AFINN')
+
+```
+
+We join the measures from both lexicons. 
+```{r}
+# Lets join them all together for plotting
+sentiment_all_pop <- sentiment_afinn_pop %>%
+bind_rows(sentiment_bing_pop %>%
+pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+mutate(sentiment = positive - negative) %>%
+select(index, sentiment, lexicon))
+
+```
+
+We create a plot for the distribution between negative and positive words within the Pop genre.
+```{r}
+sentiment_all_pop %>%
+ggplot(aes(x = index, y = sentiment, fill = lexicon)) +
+geom_col(show.legend = FALSE) +
+facet_wrap(~ lexicon) +
+labs(title = "Sentiment Analysis: “Pop",
+subtitle = 'Using the Bing, AFINN lexicon')
+
+```
+
+### Senteminet wordcloud
+
+We can now create a wordcloud looking at the positive and negative words in the Pop genre.
+```{r}
+text_tidy_Pop %>%
+inner_join(get_sentiments("bing")) %>%
+count(word, sentiment, sort = TRUE) %>%
+filter(sentiment %in% c("positive", "negative")) %>%
+pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+as.data.frame() %>%
+remove_rownames() %>%
+column_to_rownames("word") %>%
+comparison.cloud(colors = c("darkgreen", "red"),
+max.words = 100,
+title.size = 1.5)
+
+```
+
+## Rock
+
+We do a sentiment analysis based on the Rock genre.
+```{r}
+library(textdata)
+
+text_tidy_Rock_index= text_tidy_rock %>%
+mutate(index= 1:n())
+
+```
+
+We use the lexicons “bing” and “afinn” to get a measure for positivity and negativity for each word.
+We use inner_join to only get the words we use from the lexicon.
+```{r}
+#Bing
+sentiment_bing_rock <- text_tidy_Rock_index %>%
+inner_join(get_sentiments("bing")) %>%
+count(word, index = index %/% 100, sentiment) %>%
+mutate(lexicon = 'Bing')
+
+```
+
+```{r}
+# Afinn
+sentiment_afinn_rock <- text_tidy_Rock_index %>%
+inner_join(get_sentiments("afinn")) %>%
+group_by(index = index %/% 100) %>%
+summarise(sentiment = sum(value, na.rm = TRUE)) %>%
+mutate(lexicon = 'AFINN')
+
+```
+
+We join the measures from both lexicons. 
+```{r}
+# Lets join them all together for plotting
+sentiment_all_rock <- sentiment_afinn_rock %>%
+bind_rows(sentiment_bing_rock %>%
+pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+mutate(sentiment = positive - negative) %>%
+select(index, sentiment, lexicon))
+
+```
+
+We create a plot for the distribution between negative and positive words within the Rock genre.
+```{r}
+sentiment_all_rock %>%
+ggplot(aes(x = index, y = sentiment, fill = lexicon)) +
+geom_col(show.legend = FALSE) +
+facet_wrap(~ lexicon) +
+labs(title = "Sentiment Analysis: “Rock",
+subtitle = 'Using the Bing, AFINN lexicon')
+
+```
+
+### Senteminet wordcloud
+
+We can now create a wordcloud looking at the positive and negative words in the Rock genre.
+```{r}
+text_tidy_rock %>%
+inner_join(get_sentiments("bing")) %>%
+count(word, sentiment, sort = TRUE) %>%
+filter(sentiment %in% c("positive", "negative")) %>%
+pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+as.data.frame() %>%
+remove_rownames() %>%
+column_to_rownames("word") %>%
+comparison.cloud(colors = c("darkgreen", "red"),
+max.words = 100,
+title.size = 1.5)
+
+```
+
+# Bands analysis 
+
+We dont need the genre any more so we remove it. 
+```{r}
+data_band = data_start %>% 
+  filter(Idiom == "ENGLISH") %>% 
+  rename("Link" = "ALink") %>% 
+  inner_join(artists, by = c("Link")) %>% 
+  distinct() %>%
+  rename(text=Lyric) %>%
+  filter(Pop==1 | Rock==1) %>%
+  select(Artist, text)
+```
+
+We want to see the most active artists.
+```{r}
+data_band %>%
+  count(Artist, sort = T)
+```
+
+We pick the top 3 artists (in our opinion) Green day, Bon Jovi and Red Hot Chili Peppers!
+```{r}
+best_artists= data_band %>%
+  filter(Artist %in% c("Green Day",  "Bon Jovi" , "Red Hot Chili Peppers" ))
+  
+```
+
+First we tokenize the data. 
+```{r}
+text_band_tidy = best_artists %>% unnest_tokens(word, text, token = "words")
+
+head(text_band_tidy)
+```
+
+We remove short words and stopwords.
+```{r}
+text_band_tidy %<>%
+  filter(str_length(word) > 2 ) %>% 
+  group_by(word) %>%
+  ungroup() %>%
+  anti_join(stop_words, by = 'word') 
+```
+
+We use the hunspell package, which seems to produce the best stemming for our data. Reducing a word to its “root” word. 
+```{r}
+text_band_tidy %<>% 
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+  select(-word) %>%
+  rename(word = stem) 
+
+```
+
+We weight the data using tf-idf (Term-frequency Inverse document frequency). 
+```{r}
+# TFIDF weights
+text_band_tf_idf= text_band_tidy %>%
+group_by(Artist) %>%
+  count(word, sort = TRUE) %>%
+  ungroup() %>% 
+  bind_tf_idf(word, Artist, n) %>%
+  arrange(desc(tf_idf))
+
+```
+
+We show the 25 most common words within the 3 artists. 
+```{r}
+# TFIDF topwords
+text_band_tidy_Bon_Jovi= text_band_tf_idf %>%
+  filter(Artist == "Bon Jovi")%>%
+count(word, wt = tf_idf, sort = TRUE)%>%
+  filter(!word == "mo") %>% #remove
+head(25)
+
+text_band_tidy_Green_Day= text_band_tf_idf %>%
+  filter(Artist == "Green Day")%>%
+count(word, wt = tf_idf, sort = TRUE)%>%
+  filter(!word == "intro")%>%
+  filter(!word == "riff") %>% #remove
+head(25)
+
+text_band_tidy_RHCP= text_band_tf_idf %>%
+  filter(Artist == "Red Hot Chili Peppers")%>%
+count(word, wt = tf_idf, sort = TRUE)%>%
+  filter(!word == "co")%>%
+  filter(!word == "cos") %>% #remove
+head(25)
+
+```
+
+We now plot the 20 most used words within each genre. 
+```{r}
+labels_words_band <- text_band_tf_idf %>%
+  group_by(Artist) %>%
+  count(word, wt = tf_idf, sort = TRUE, name = "tf_idf") %>%
+  dplyr::slice(1:20)%>%
+  filter(!word == "mo")%>%
+  filter(!word == "intro")%>%
+  filter(!word == "riff")%>%
+  filter(!word == "co")%>%
+  filter(!word == "cos") %>% 
+  ungroup() 
+
+labels_words_band %>%
+  mutate(word = reorder_within(word, by = tf_idf, within = Artist)) %>%
+  ggplot(aes(x = word, y = tf_idf, fill = Artist)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~Artist, ncol = 2, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  theme(axis.text.y = element_text(size = 6))
+```
+
+## Songs of the top 3 artist
+
+```{r}
+# Greenday
+
+sentiment_green_day= text_band_tidy %>%
+  filter(Artist == "Green Day") %>%
+  inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+  count(sentiment) %>% # count the # of positive & negative words
+  spread(sentiment, n, fill = 0) %>% # made data wide rather than narrow
+  mutate(sentiment = positive - negative) # # of positive words - # of negative owrds
+
+sentiment_green_day
+
+# Bon Jovi
+
+sentiment_Bon_Jovi= text_band_tidy %>%
+  filter(Artist == "Bon Jovi") %>%
+  inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+  count(sentiment) %>% # count the # of positive & negative words
+  spread(sentiment, n, fill = 0) %>% # made data wide rather than narrow
+  mutate(sentiment = positive - negative) # # of positive words - # of negative owrds
+
+sentiment_Bon_Jovi
+
+# Red Hot Chilie Pepper
+
+sentiment_RHCP= text_band_tidy %>%
+  filter(Artist == "Red Hot Chili Peppers") %>%
+  inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+  count(sentiment) %>% # count the # of positive & negative words
+  spread(sentiment, n, fill = 0) %>% # made data wide rather than narrow
+  mutate(sentiment = positive - negative) # # of positive words - # of negative owrds
+
+sentiment_RHCP
+```
+
+We can see all the artist use more negative laden words than positive  
+
+
+
+To see sentiment for each song we can join the song names again. 
+
+```{r}
+data_song_name = data_start %>% 
+  filter(Idiom == "ENGLISH") %>% 
+  rename("Link" = "ALink") %>% 
+  inner_join(artists, by = c("Link")) %>% 
+  distinct() %>%
+  filter(Artist %in% c("Bon Jovi", "Green Day", "Red Hot Chili Peppers")) %>%
+  rename(text=Lyric) %>%
+  filter(Pop==1 | Rock==1) %>%
+  select(SName, text)
+```
+
+
+We tokenize
+```{r}
+text_song_tidy = data_song_name %>% unnest_tokens(word, text, token = "words")
+```
+
+We remove short words and stopwords.
+```{r}
+text_song_tidy %<>%
+  filter(str_length(word) > 2 ) %>% 
+  group_by(word) %>%
+  ungroup() %>%
+  anti_join(stop_words, by = 'word') 
+```
+
+We use the hunspell package, which seems to produce the best stemming for our data. Reducing a word to its “root” word. 
+```{r}
+text_song_tidy %<>% 
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+  select(-word) %>%
+  rename(word = stem) 
+
+```
+
+
+
+We will now wheight by tf-idf 
+
+```{r}
+# TFIDF weights
+text_song_tf_idf= text_song_tidy %>%
+group_by(SName) %>%
+  count(word, sort = TRUE) %>%
+  ungroup() %>% 
+  bind_tf_idf(word, SName, n) %>%
+  arrange(desc(tf_idf))
+```
+
+We can now add the band name for our chossen artists
+
+```{r}
+
+data_song_artist = data_start %>% 
+  filter(Idiom == "ENGLISH") %>% 
+  rename("Link" = "ALink") %>% 
+  inner_join(artists, by = c("Link")) %>% 
+  distinct() %>%
+  filter(Artist %in% c("Bon Jovi", "Green Day", "Red Hot Chili Peppers")) %>%
+  rename(text=Lyric) %>%
+  filter(Pop==1 | Rock==1) %>%
+  select(Artist,SName)
+
+
+text_song_tf_idf %<>%
+  inner_join(data_song_artist, by= c("SName"))
+
+# For Green Day
+
+green_day_songs=text_song_tf_idf %>%
+  filter(Artist == "Green Day") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative")))%>%
+  count(sentiment_song)
+
+# For RHCP
+
+RHCP_songs=text_song_tf_idf %>%
+  filter(Artist == "Red Hot Chili Peppers") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative")))%>%
+  count(sentiment_song)
+
+# Bon Jovi
+
+Bon_Jovi_songs=text_song_tf_idf %>%
+  filter(Artist == "Bon Jovi") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative")))%>%
+  count(sentiment_song)
+
+
+# For all 
+
+all_songs=text_song_tf_idf %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative")))%>%
+  inner_join(data_song_artist, by= c("SName"))
+
+
+ggplot(all_songs, aes(x = Artist, y = sum, color = Artist)) + 
+  geom_boxplot() 
+
+```
+We can here that the overall score of the songs seems to be negative for all three artists. We can tho see that RHCP on the averrage has ths most positive songs looking at the three artists. 
+
+
+## Sentiment over time
+
+
+We found a dataset including release date for songs on spotify 
+```{r}
+data_releaseyear <- read_csv("data.csv") # ligger på Github
+```
+
+
+```{r}
+release_year_bon_jovi= data_releaseyear %>% 
+  filter(artists == "['Bon Jovi']") %>%
+  select(name, year)
+
+release_year_RHCP= data_releaseyear %>% 
+  filter(artists == "['Red Hot Chili Peppers']") %>%
+  select(name, year)
+
+release_year_Green_Day= data_releaseyear %>% 
+  filter(artists == "['Green Day']") %>%
+  select(name, year)
+```
+
+
+We will innerjoin with the datasets above
+
+
+```{r}
+#Bon Jovi
+
+Bon_Jovi_songs=text_song_tf_idf %>%
+  filter(Artist == "Bon Jovi") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative"))) %>%
+  inner_join(release_year_bon_jovi, by= c("SName" = "name")) %>%
+  distinct(SName, .keep_all = T)
+
+
+#RHCP
+RHCP_songs=text_song_tf_idf %>%
+  filter(Artist == "Red Hot Chili Peppers") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative"))) %>%
+  inner_join(release_year_RHCP, by= c("SName" = "name")) %>%
+  distinct(SName, .keep_all = T)
+
+## Green Day
+
+Green_day_songs=text_song_tf_idf %>%
+  filter(Artist == "Green Day") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("bing"))%>%
+  mutate(sentiment= ifelse(sentiment == "negative", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "positive", ifelse(sum == 0, "neutral", "negative"))) %>%
+  inner_join(release_year_Green_Day, by= c("SName" = "name")) %>%
+  distinct(SName, .keep_all = T)
+
+```
+Development over time 
+```{r}
+
+## Bon Jovi 
+ggplot(Bon_Jovi_songs, aes(x = as.numeric(year), y = sum)) + 
+  geom_point(aes(color = sentiment_song))+ # add points to our plot, color-coded by president
+  geom_smooth(method = "auto") # pick a method & fit a model
+
+
+## RHCP
+
+ggplot(RHCP_songs, aes(x = as.numeric(year), y = sum)) + 
+  geom_point(aes(color = sentiment_song))+ # add points to our plot, color-coded by president
+  geom_smooth(method = "auto") # pick a method & fit a model
+
+
+## Green Day
+
+ggplot(Green_day_songs, aes(x = as.numeric(year), y = sum)) + 
+  geom_point(aes(color = sentiment_song))+ # add points to our plot, color-coded by president
+  geom_smooth(method = "auto") # pick a method & fit a model
+
+```
+
+We can now see the development of the sentiment of the songs from the three artists. it looks like the artists at some point go for more positive songs, but return to more negative again. 
+
+# Saddness og joy
+
+We will now look at the development of Saddness or joy in the songs of the three artists
+
+```{r}
+#NRC
+sentiment_bing <- text_tidy_Pop_Rock_index %>%
+inner_join(get_sentiments("nrc")) %>%
+count(word, index = index %/% 100, sentiment) %>%
+mutate(lexicon = 'Bing')
+
+
+#Bon Jovi
+
+Bon_Jovi_songs_joy_sadness=text_song_tf_idf %>%
+  filter(Artist == "Bon Jovi") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("nrc"))%>%
+  filter(sentiment %in% c("sadness", "joy")) %>%
+  mutate(sentiment= ifelse(sentiment == "sadness", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "joy", ifelse(sum == 0, "neutral", "sadness"))) %>%
+  inner_join(release_year_bon_jovi, by= c("SName" = "name")) %>%
+  distinct(SName, .keep_all = T)
+
+## Green Day
+
+Green_Day_songs_joy_sadness=text_song_tf_idf %>%
+  filter(Artist == "Green Day") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("nrc"))%>%
+  filter(sentiment %in% c("sadness", "joy")) %>%
+  mutate(sentiment= ifelse(sentiment == "sadness", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "joy", ifelse(sum == 0, "neutral", "sadness"))) %>%
+  inner_join(release_year_Green_Day, by= c("SName" = "name")) %>%
+  distinct(SName, .keep_all = T)
+
+## RHCP
+
+RHCP_songs_joy_sadness=text_song_tf_idf %>%
+  filter(Artist == "Red Hot Chili Peppers") %>%
+  arrange(desc(tf_idf))%>% 
+  inner_join(get_sentiments("nrc"))%>%
+  filter(sentiment %in% c("sadness", "joy")) %>%
+  mutate(sentiment= ifelse(sentiment == "sadness", -1, 1)) %>%
+  group_by(SName) %>%
+  summarise(sum= sum(sentiment)) %>%
+  mutate(sentiment_song= ifelse(sum > 0, "joy", ifelse(sum == 0, "neutral", "sadness"))) %>%
+  inner_join(release_year_RHCP, by= c("SName" = "name")) %>%
+  distinct(SName, .keep_all = T)
+
+
+```
+```{r}
+
+## Bon Jovi 
+ggplot(Bon_Jovi_songs_joy_sadness, aes(x = as.numeric(year), y = sum)) + 
+  geom_point(aes(color = sentiment_song))+ # add points to our plot, color-coded by president
+  geom_smooth(method = "auto") # pick a method & fit a model
+
+
+## RHCP
+
+ggplot(RHCP_songs_joy_sadness, aes(x = as.numeric(year), y = sum)) + 
+  geom_point(aes(color = sentiment_song))+ # add points to our plot, color-coded by president
+  geom_smooth(method = "auto") # pick a method & fit a model
+
+
+## Green Day
+
+ggplot(Green_Day_songs_joy_sadness, aes(x = as.numeric(year), y = sum)) + 
+  geom_point(aes(color = sentiment_song))+ # add points to our plot, color-coded by president
+  geom_smooth(method = "auto") # pick a method & fit a model
+
+```
+It looks like the artists song tend to be more sadd over time, it's actually kinda of sad to see that..... 
+
+
+# Neural network analysis
+
+Our data set didnt contain labels so we made them ourselves by first tokenizing
+```{r}
+library(tidytext)
+text_tidy = data %>% unnest_tokens(word, text, token = "words")
+
+head(text_tidy)
+```
+
+We remove stopwords and words less than two words.
+```{r}
+text_tidy %<>%
+  filter(str_length(word) > 2 ) %>% 
+  group_by(word) %>%
+  ungroup() %>%
+  anti_join(stop_words, by = 'word') 
+```
+
+Then we stem our words.
+```{r}
+library(hunspell)
+text_tidy %>%
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+  count(stem, sort = TRUE)
+
+
+text_tidy %<>% 
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+   select(-word) %>%
+  rename(word = stem)
+
+
+
+```
+
+Then we take the 10000 top words, but our data set after preprocessing only contains 8047 words so we move forward with them
+```{r}
+top_10000_words=text_tidy %>%
+  count(word,sort = T) %>%
+  head(10000) %>%
+  select(word)
+
+data_top_10000=top_10000_words %>%
+  left_join(text_tidy, by= c("word")) 
+
+```
+
+```{r}
+sentiment_nrc <- text_tidy %>%  
+  inner_join(get_sentiments("nrc"))
+
+multi_data=sentiment_nrc %>%
+  filter(sentiment %in% c("negative", "positive", "joy", "fear")) %>%
+  count(name, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(label= pmax(positive, joy, negative, fear)) %>%
+  mutate(label= ifelse(label == fear, "fear", ifelse(label == positive, "positive", ifelse(label == negative, "negative", ifelse(label == joy, "joy","none label")))))  %>%
+  select(name, label) %>%
+  inner_join(data)
+
+
+multi_data_new=sentiment_nrc %>%
+  filter(sentiment %in% c("trust", "sadness", "joy", "fear")) %>%
+  count(name, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(label= pmax(trust, joy, sadness, fear)) %>%
+  mutate(label= ifelse(label == fear, "fear", ifelse(label == trust, "trust", ifelse(label == sadness, "sadness", ifelse(label == joy, "joy","none label")))))  %>%
+  select(name, label) %>%
+  rename(y= label)%>%
+  inner_join(data)
+
+multi_data_new %>%
+  count(y)
+
+
+multi_data %>%
+  count(label)
+```
+Download glove6b
+```{r}
+if (!file.exists('glove.6B.zip')) {
+  download.file('https://nlp.stanford.edu/data/glove.6B.zip',destfile = 'glove.6B.zip')
+  unzip('glove.6B.zip')
+}
+
+```
+load into R
+```{r}
+vectors = data.table::fread('glove.6B.300d.txt', data.table = F,  encoding = 'UTF-8') 
+colnames(vectors) = c('word',paste('dim',1:300,sep = '_'))
+```
+```{r}
+as_tibble(vectors)
+```
+
+
+
+
+
+We start by creating test and training data 
+
+```{r}
+library(rsample)
+
+split5= initial_split(multi_data_new, prop = 0.75)
+
+train_data5= training(split5)
+test_data5= testing(split5)
+```
+
+
+
+```{r}
+x_train_data5= train_data5 %>% pull(text)
+
+x_test_data5= test_data5 %>% pull(text)
+```
+
+```{r}
+y_train_data5= train_data5 %>% select('y') %>% mutate(y= recode(y, "joy" = 1, "sadness" = 2,"fear" =3, "trust"= 4)) %>%
+  as.matrix()
+
+
+y_test_data5= test_data5 %>% select('y') %>% mutate(y= recode(y, "joy" = 1, "sadness" = 2,"fear" =3, "trust"= 4)) %>% as.matrix()
+```
+
+
+```{r}
+to_one_hot <- function(labels, dimension = 4) {
+  results <- matrix(0, nrow = length(labels), ncol = dimension)
+  for (i in 1:length(labels))
+    results[i, labels[[i]]] <- 1
+  results
+}
+
+
+one_hot_train_labels <- to_one_hot(y_train_data5)
+one_hot_test_labels <- to_one_hot(y_test_data5)
+```
+
+
+```{r}
+max_words = 10000
+maxlen = 200
+dim_size = 300
+```
+
+
+```{r}
+library(keras)
+
+word_seqs = text_tokenizer(num_words = max_words) %>%
+  fit_text_tokenizer(x_train_data5)
+
+
+word_seqs_test = text_tokenizer(num_words = max_words) %>%
+  fit_text_tokenizer(x_test_data5)
+```
+
+
+
+```{r}
+x_train = texts_to_sequences(word_seqs, x_train_data5) %>%
+  pad_sequences( maxlen = maxlen)
+
+x_test = texts_to_sequences(word_seqs_test, x_test_data5) %>%
+  pad_sequences( maxlen = maxlen)
+```
+
+
+```{r}
+word_indices = unlist(word_seqs$word_index)
+```
+
+```{r}
+dic = data.frame(word = names(word_indices), key = word_indices, stringsAsFactors = FALSE) %>%
+  arrange(key) %>% .[1:max_words,]
+```
+
+```{r}
+word_embeds = dic  %>% left_join(vectors) %>% .[,3:302] %>% replace(., is.na(.), 0) %>% as.matrix()
+```
+```{r}
+input = layer_input(shape = list(maxlen), name = "input")
+```
+
+```{r}
+model <- keras_model_sequential()
+
+model = input %>%
+  layer_embedding(input_dim = max_words, output_dim = dim_size, input_length = maxlen, 
+                  weights = list(word_embeds), trainable = FALSE) %>%
+  layer_spatial_dropout_1d(rate = 0.2) %>%
+  bidirectional(
+    layer_lstm(units = 80, return_sequences = TRUE) 
+  )
+max_pool = model %>% layer_global_max_pooling_1d()
+ave_pool = model %>% layer_global_average_pooling_1d()
+
+output = layer_concatenate(list(ave_pool, max_pool)) %>%
+  layer_dense(units = 4, activation = "softmax")
+
+model = keras_model(input, output)
+```
+
+
+```{r}
+model %>% compile(
+  optimizer = "adam",
+  loss = "categorical_crossentropy",
+  metrics = tensorflow::tf$keras$metrics$AUC()
+)
+```
+
+```{r}
+history = model %>% keras::fit(
+  x_train, one_hot_train_labels,
+  epochs = 4,
+  batch_size = 256,
+  validation_split = 0.2
+)
+```
+
+```{r}
+metrics_gru = model %>% evaluate(x_test, one_hot_test_labels); metrics_gru
+```
